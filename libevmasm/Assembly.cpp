@@ -90,7 +90,7 @@ void Assembly::importAssemblyItemsFromJSON(Json const& _code, std::vector<std::s
 	solAssert(m_codeSections.size() == 1);
 	solAssert(m_codeSections[0].items.empty());
 	// TODO: Add support for EOF and more than one code sections.
-	solUnimplementedAssert(!m_eofVersion.has_value(), "Assembly output for EOF is not yet implemented.");
+	solUnimplementedAssert(!m_eofVersion.has_value(), "Assembly import for EOF is not yet implemented.");
 	solRequire(_code.is_array(), AssemblyImportException, "Supplied JSON is not an array.");
 	for (auto jsonItemIter = std::begin(_code); jsonItemIter != std::end(_code); ++jsonItemIter)
 	{
@@ -452,7 +452,7 @@ Json Assembly::assemblyJSON(std::map<std::string, unsigned> const& _sourceIndice
 	Json root;
 	root[".code"] = Json::array();
 	Json& code = root[".code"];
-    // TODO: support EOF
+	// TODO: support EOF
 	solUnimplementedAssert(!m_eofVersion.has_value(), "Assembly output for EOF is not yet implemented.");
 	solAssert(m_codeSections.size() == 1);
 	for (AssemblyItem const& item: m_codeSections.front().items)
@@ -708,10 +708,10 @@ AssemblyItem Assembly::newFunctionCall(uint16_t _functionID) const
 	solAssert(_functionID < m_codeSections.size(), "Call to undeclared function.");
 	solAssert(_functionID > 0, "Cannot call section 0");
 	auto const& section = m_codeSections.at(_functionID);
-	if (section.outputs != 0x80)
-		return AssemblyItem::functionCall(_functionID, section.inputs, section.outputs);
-	else
+	if (section.nonReturning)
 		return AssemblyItem::jumpToFunction(_functionID, section.inputs, section.outputs);
+	else
+		return AssemblyItem::functionCall(_functionID, section.inputs, section.outputs);
 }
 
 AssemblyItem Assembly::newFunctionReturn() const
@@ -720,14 +720,14 @@ AssemblyItem Assembly::newFunctionReturn() const
 	return AssemblyItem::functionReturn();
 }
 
-uint16_t Assembly::createFunction(uint8_t _args, uint8_t _rets)
+uint16_t Assembly::createFunction(uint8_t _args, uint8_t _rets, bool _nonReturning)
 {
 	size_t functionID = m_codeSections.size();
 	solRequire(functionID < 1024, AssemblyException, "Too many functions for EOF");
 	solAssert(m_currentCodeSection == 0, "Functions need to be declared from the main block.");
-	solAssert(_rets <= 0x80, "Too many function returns.");
-	solAssert(_args <= 127, "Too many function inputs.");
-	m_codeSections.emplace_back(CodeSection{_args, _rets, {}});
+	solRequire(_rets <= 127, AssemblyException, "Too many function returns.");
+	solRequire(_args <= 127, AssemblyException, "Too many function inputs.");
+	m_codeSections.emplace_back(CodeSection{_args, _rets, _nonReturning, {}});
 	return static_cast<uint16_t>(functionID);
 }
 
@@ -1103,7 +1103,8 @@ std::tuple<bytes, std::vector<size_t>, size_t> Assembly::createEOFHeader(std::se
 	for (auto const& codeSection: m_codeSections)
 	{
 		retBytecode.push_back(codeSection.inputs);
-		retBytecode.push_back(codeSection.outputs);
+		// According to EOF spec function output num equals 0x80 means non-returning function
+		retBytecode.push_back(codeSection.nonReturning ? 0x80 : codeSection.outputs);
 		appendBigEndianUint16(retBytecode, calculateMaxStackHeight(codeSection));
 	}
 
@@ -1520,9 +1521,9 @@ LinkerObject const& Assembly::assembleEOF() const
 	auto const subIdsReplacements = findReferencedContainers();
 	auto const referencedSubIds = keys(subIdsReplacements);
 
-	solRequire(!m_codeSections.empty(), AssemblyException, "Expected at least one code section.");
-	solRequire(
-		m_codeSections.front().inputs == 0 && m_codeSections.front().outputs == 0x80, AssemblyException,
+	solAssert(!m_codeSections.empty(), "Expected at least one code section.");
+	solAssert(
+		m_codeSections.front().inputs == 0 && m_codeSections.front().outputs == 0 && m_codeSections.front().nonReturning,
 		"Expected the first code section to have zero inputs and be non-returning."
 	);
 
@@ -1624,12 +1625,11 @@ LinkerObject const& Assembly::assembleEOF() const
 				size_t const index = static_cast<uint16_t>(item.data());
 				solAssert(index < m_codeSections.size());
 				solAssert(item.functionSignature().argsNum <= 127);
-				solAssert(item.type() == JumpF || item.functionSignature().retsNum <= 127);
-				solAssert(item.type() == CallF || item.functionSignature().retsNum <= 128);
+				solAssert(item.functionSignature().retsNum <= 127);
 				solAssert(m_codeSections[index].inputs == item.functionSignature().argsNum);
 				solAssert(m_codeSections[index].outputs == item.functionSignature().retsNum);
-				// If CallF the function can continue.
-				solAssert(item.type() == JumpF || item.functionSignature().canContinue());
+				// If CallF the function cannot be non-returning.
+				solAssert(item.type() == JumpF || !m_codeSections[index].nonReturning);
 				appendBigEndianUint16(ret.bytecode, item.data());
 				break;
 			}
@@ -1641,6 +1641,14 @@ LinkerObject const& Assembly::assembleEOF() const
 			}
 		}
 
+		if (ret.bytecode.size() - sectionStart > std::numeric_limits<uint16_t>::max())
+			// TODO: Include source location. Note that origin locations we have in debug data are
+			// not usable for error reporting when compiling pure Yul because they point at the optimized source.
+			throw Error(
+				2202_error,
+				Error::Type::CodeGenerationError,
+				"Code section too large for EOF."
+			);
 		setBigEndianUint16(ret.bytecode, codeSectionSizePositions[codeSectionIndex], ret.bytecode.size() - sectionStart);
 	}
 
@@ -1651,7 +1659,8 @@ LinkerObject const& Assembly::assembleEOF() const
 		solAssert(tagPos != std::numeric_limits<size_t>::max(), "Reference to tag without position.");
 
 		ptrdiff_t const relativeJumpOffset = static_cast<ptrdiff_t>(tagPos) - (static_cast<ptrdiff_t>(refPos) + 2);
-		solRequire(-0x8000 <= relativeJumpOffset && relativeJumpOffset <= 0x7FFF, AssemblyException, "Relative jump too far");
+		// This cannot happen in practice because we'll run into section size limit first.
+		solAssert(-0x8000 <= relativeJumpOffset && relativeJumpOffset <= 0x7FFF, "Relative jump too far");
 		solAssert(relativeJumpOffset < -2 || 0 <= relativeJumpOffset, "Relative jump offset into immediate argument.");
 		setBigEndianUint16(ret.bytecode, refPos, static_cast<size_t>(static_cast<uint16_t>(relativeJumpOffset)));
 	}
@@ -1682,8 +1691,14 @@ LinkerObject const& Assembly::assembleEOF() const
 	// DATALOADN loads 32 bytes from EOF data section zero padded if reading out of data bounds.
 	// In our case we do not allow DATALOADN with offsets which reads out of data bounds.
 	auto const staticAuxDataSize = maxAuxDataLoadNOffset.has_value() ? (*maxAuxDataLoadNOffset + 32u) : 0u;
-	solRequire(preDeployDataSectionSize + staticAuxDataSize < std::numeric_limits<uint16_t>::max(), AssemblyException,
-		"Invalid DATALOADN offset.");
+	auto const preDeployAndStaticAuxDataSize = preDeployDataSectionSize + staticAuxDataSize;
+
+	if (preDeployAndStaticAuxDataSize > std::numeric_limits<uint16_t>::max())
+		throw Error(
+			3965_error,
+			Error::Type::CodeGenerationError,
+			"The highest accessed data offset exceeds the maximum possible size of the static auxdata section."
+		);
 
 	// If some data was already added to data section we need to update data section refs accordingly
 	if (preDeployDataSectionSize > 0)
@@ -1693,8 +1708,6 @@ LinkerObject const& Assembly::assembleEOF() const
 			// staticAuxDataOffset < staticAuxDataSize
 			setBigEndianUint16(ret.bytecode, refPosition, staticAuxDataOffset + preDeployDataSectionSize);
 		}
-
-	auto const preDeployAndStaticAuxDataSize = preDeployDataSectionSize + staticAuxDataSize;
 
 	setBigEndianUint16(ret.bytecode, dataSectionSizePosition, preDeployAndStaticAuxDataSize);
 
